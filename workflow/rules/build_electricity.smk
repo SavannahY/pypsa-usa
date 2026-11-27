@@ -1071,6 +1071,7 @@ rule add_electricity:
 rule aggregate_to_substations:
     params:
         aggregation_strategies=config["clustering"].get("aggregation_strategies", {}),
+        length_factor=config_provider("lines", "length_factor"),
         topological_boundaries=config_provider(
             "model_topology", "topological_boundaries"
         ),
@@ -1129,6 +1130,7 @@ if "EGS" in config["electricity"]["extendable_carriers"]["Generator"]:
 rule cluster_resources:
     params:
         aggregation_strategies=config["clustering"].get("aggregation_strategies", {}),
+        length_factor=config_provider("lines", "length_factor"),
         focus_weights=config_provider("focus_weights", default=False),
         simplify_network=config_provider("clustering", "simplify_network"),
         planning_horizons=config_provider("scenario", "planning_horizons"),

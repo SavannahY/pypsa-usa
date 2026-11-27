@@ -1,7 +1,10 @@
 """Unit tests for cluster_simpl helpers."""
 
 import os
+import runpy
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -169,3 +172,79 @@ def test_county_clustering_works_on_an_interconnection_seam(substation_network):
     assert len(buses) == 3
     assert buses.loc["p9_06001_eastern", "interconnect"] == "eastern"
     assert buses.loc["p9_06001_western", "interconnect"] == "western"
+
+
+@pytest.mark.parametrize("length_factor", [1.25, 1.5])
+def test_topology_stages_use_configured_line_lengths(substation_network, tmp_path, length_factor):
+    n = substation_network
+    n.buses["sub_id"] = [1, 2, 3, 4]
+    n.buses["v_nom"] = 230.0
+    n.buses["state"] = "CA"
+    n.buses["balancing_area"] = "CISO"
+    n.buses["reeds_ba"] = n.buses["reeds_zone"]
+    n.buses["substation_off"] = False
+    n.lines["v_nom"] = 230.0
+    n.lines["b"] = 1e-6
+    n.add("Link", "dc", bus0="s1", bus1="s4", carrier="DC", p_nom=100.0)
+
+    def branch_distances(network, branches):
+        coordinates = network.buses[["x", "y"]]
+        return pypsa.geo.haversine_pts(coordinates.loc[branches.bus0], coordinates.loc[branches.bus1])
+
+    scripts = Path(__file__).resolve().parents[1]
+    base_path = tmp_path / "base.nc"
+    aggregate_path = tmp_path / "substations.nc"
+    n.export_to_netcdf(base_path)
+    params = SimpleNamespace(aggregation_strategies={}, length_factor=length_factor)
+    aggregation = SimpleNamespace(
+        rule="aggregate_to_substations",
+        config={},
+        log={0: tmp_path / "aggregate.log"},
+        input=SimpleNamespace(network=base_path),
+        output=SimpleNamespace(network=aggregate_path, busmap=tmp_path / "substations.csv"),
+        params=SimpleNamespace(**vars(params), topological_boundaries="county", regional_transmission_costs=False),
+    )
+    runpy.run_path(
+        str(scripts / "aggregate_to_substations.py"), init_globals={"snakemake": aggregation}, run_name="__main__"
+    )
+
+    aggregate = pypsa.Network(aggregate_path)
+    assert aggregate.lines.length.to_numpy() == pytest.approx(
+        branch_distances(aggregate, aggregate.lines) * length_factor
+    )
+    assert aggregate.links.length.to_numpy() == pytest.approx(
+        branch_distances(aggregate, aggregate.links) * length_factor
+    )
+    for parameter in ("r", "x", "b"):
+        assert sorted(aggregate.lines[parameter]) == pytest.approx(sorted(n.lines[parameter]))
+
+    empty_regions = tmp_path / "empty.geojson"
+    empty_regions.write_text('{"type": "FeatureCollection", "features": []}')
+    for simpl in ("", "county"):
+        name = simpl or "identity"
+        clustered_path = tmp_path / f"{name}.nc"
+        clustering = SimpleNamespace(
+            rule="cluster_resources",
+            config={"solving": {"solver": {"name": "highs"}}},
+            log={0: tmp_path / f"{name}.log"},
+            input=SimpleNamespace(
+                network=aggregate_path, regions_onshore=empty_regions, regions_offshore=empty_regions
+            ),
+            output=SimpleNamespace(
+                network=clustered_path,
+                busmap=tmp_path / f"{name}.csv",
+                regions_onshore=tmp_path / f"{name}-onshore.geojson",
+                regions_offshore=tmp_path / f"{name}-offshore.geojson",
+            ),
+            wildcards=SimpleNamespace(simpl=simpl),
+            params=SimpleNamespace(**vars(params), simplify_network={"algorithm": "kmeans"}, focus_weights=False),
+        )
+        runpy.run_path(str(scripts / "cluster_simpl.py"), init_globals={"snakemake": clustering}, run_name="__main__")
+
+        clustered = pypsa.Network(clustered_path)
+        assert clustered.lines.length.to_numpy() == pytest.approx(
+            branch_distances(clustered, clustered.lines) * length_factor,
+        )
+        assert clustered.links.length.to_numpy() == pytest.approx(
+            branch_distances(clustered, clustered.links) * length_factor,
+        )
